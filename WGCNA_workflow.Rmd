@@ -1,0 +1,620 @@
+---
+title: "Single Embryo WGCNA Workflow"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(stringsAsFactors = FALSE);
+
+library(ggplot2)
+library(WGCNA)
+library(corrplot)
+library(lmtest)
+library(flashClust)
+library(mgcv)
+library(tidyr)
+library(dplyr)
+library(tinytex)
+library(RCy3)
+library(readxl)
+library(mgcv)
+library(reshape2)
+library(data.table)
+library(nlraa)
+library(corrr)
+library(Hmisc)
+library(igraph)
+library(ggraph)
+library(mixR)
+library(graphlayouts)
+library(RcmdrMisc)
+
+### This section should be modified for your dataset
+directory = ("/home/zachary.madaj/bbc-secondary/research/LEMH_20231017_single_embryo_VBCS-759/workflow")
+
+allele_specific = TRUE
+
+set_soft_power = 12
+min_mod_size=10
+
+```
+
+# WGCNA {.tabset}
+## Transcripts {.tabset}
+### Fitting WGCNA Steps
+
+```{r}
+
+# Transcript Matrix
+trans_e = read.csv(paste0(directory,"/norm_paternal_reads_embryo_ase.csv"),header=T)
+
+meta = read_excel("/home/zachary.madaj/bbc-secondary/research/LEMH_20231017_single_embryo_VBCS-759/New 2024/new_se/metadata.xlsx")
+
+# load the metadata file
+meta = read_excel(paste0(directory,"/metadata.xlsx"))
+meta = meta[substr(meta$embryoID,1,1) !="U",]
+
+# After removing the unfertilized embryos, we need to re-level the pseudo-time so there aren't any holes.  
+meta$embryo_pt = factor(meta$embryo_pt)
+meta$embryo_pt = as.numeric(meta$embryo_pt)
+
+
+
+if(!allele_specific){
+##Comment this out of running allele specific
+  trans_e = trans_e[,colnames(trans_e)[substr(colnames(trans_e),1,1) != "U"]]
+} else {
+    
+  meta2 = read.csv("/home/zachary.madaj/bbc-secondary/research/LEMH_20231017_single_embryo_VBCS-759/New 2024/new_se/metadata_ase.csv")
+  
+  t.d = as.data.frame(t(trans_e))
+  colnames(t.d) = make.names(rownames(trans_e))
+  t.d = t.d[-1,]
+  t.d = t.d[substr(rownames(t.d),1,1)=="U",]
+  
+  #Remove all genes that had non-zero expression in at least 2 unfertilized eggs
+  trans_e = trans_e[-which(apply(t.d,2,function(x) {sum(I(x >=2)) })>=1) ,]
+  
+  # Remove unfertilized embryos, which have an ID with U in the first byte
+  trans_e = trans_e[,colnames(trans_e)[substr(colnames(trans_e),1,1) != "U"]]
+  
+  #Save a list of genes removed
+  False_positives = meta2$primary_FBid[which(apply(t.d,2,function(x) {sum(I(x >=2)) })>=1)]
+  write.csv(False_positives,paste0(directory,"/FP_expressed_in_unfert.csv"),row.names = F)
+  
+  rownames(trans_e) = meta2$primary_FBid[-which(apply(t.d,2,function(x) {sum(I(x >=2)) })>=1)]
+  
+  trans_e=trans_e[which(apply(trans_e,1,function(x) {sum(I(x >=3)) }) >= 10),]
+}
+
+
+
+datExpr=t(trans_e[,-1])
+#Create e genes names variable and transpose the expression matrix for WGCNA
+if(!allele_specific) {SubGeneNames=trans_e$X } else {SubGeneNames = colnames(datExpr)}
+
+```
+
+### Soft Thresholding with signed hybrid
+
+```{r}
+
+powers = c(c(1:10), seq(from = 12, to=20, by=2));
+
+sft=pickSoftThreshold(datExpr,dataIsExpr = TRUE,powerVector = powers,corFnc = cor,corOptions = list(use = 'p'),networkType = "signed hybrid")
+
+powers = c(c(1:10), seq(from = 12, to=20, by=2));
+
+# Plot the results
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit, signed hybrid hybrid R^2",type="n", main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],labels=powers,cex=cex1,col="red");
+
+# Red line corresponds to using an R^2 cut-off
+abline(h=0.80,col="red")
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+
+
+```
+
+
+
+```{r}
+
+# Choose a soft power that looks like a good balance of R^2 and connectivity. This will change with each dataset
+softPower = set_soft_power;
+
+#calclute the adjacency matrix
+adj= adjacency(datExpr,type = "signed hybrid", power = softPower);
+
+#turn adjacency matrix into topological overlap to minimize the effects of noise and spurious associations
+TOM=TOMsimilarityFromExpr(datExpr,networkType = "signed hybrid", TOMType = "none", power = softPower)
+
+colnames(TOM) =rownames(TOM) = SubGeneNames
+dissTOM=1-TOM
+
+geneTree = flashClust(as.dist(dissTOM),method="average")
+
+#plot the resulting clustering tree (dendrogram)
+plot(geneTree, xlab="", sub="",cex=0.3)
+
+# Set the minimum module size
+minModuleSize = min_mod_size;
+
+# Module identification using dynamic tree cut
+dynamicMods = cutreeDynamic(dendro = geneTree,  method="tree", minClusterSize = minModuleSize,deepSplit = 0);
+
+#the following command gives the module labels and the size of each module. Lable 0 is reserved for unassigned genes
+table(dynamicMods)
+
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Gene dendrogram and module colors")
+
+restGenes= (dynamicColors != "grey")
+diss1=1-TOMsimilarityFromExpr(datExpr[,restGenes], power = softPower)
+
+colnames(diss1) =rownames(diss1) =SubGeneNames[restGenes]
+
+hier1=flashClust(as.dist(diss1), method="average" )
+
+plotDendroAndColors(hier1, dynamicColors[restGenes], "Dynamic Tree Cut", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Gene dendrogram and module colors")
+
+```
+
+
+```{r}
+
+dynamicMods = mergeCloseModules(datExpr, colors = dynamicColors,cutHeight = 0.05)
+dynamicColors = dynamicMods$colors
+diag(diss1) = NA;
+
+#Visualize the Tom plot. 
+sizeGrWindow(7,7)
+TOMplot(diss1, hier1, as.character(dynamicColors[restGenes]))
+
+```
+
+
+```{r}
+
+module.order <- unlist(tapply(1:ncol(datExpr),as.factor(dynamicColors),I))
+m<-t(t(datExpr[,module.order])/apply(datExpr[,module.order],2,max))
+heatmap(t(m),zlim=c(0,1),col=gray.colors(100),Rowv=NA,Colv=NA,labRow=NA,scale="none",RowSideColors=dynamicColors[module.order])
+
+# module_colors= setdiff(unique(dynamicColors), "grey")
+module_colors= unique(dynamicColors)
+module=NULL
+for (color in module_colors){
+    module=c(module,(paste0(color,",",SubGeneNames[which(dynamicColors==color)])))
+}
+
+
+# Write the modules
+write.table(module, paste0(directory,"/non_allele_PANGEA_Gene_Symbol.txt"), sep="\t", row.names=FALSE, col.names=FALSE,quote=FALSE)
+   
+# This is to grab the flybase gene names and print the modules again with flybase names
+
+if(!allele_specific){
+
+  flybase = read_excel(paste0(directory,"/metadata.xlsx"),sheet=3)
+  genes = data.frame(GeneName = SubGeneNames)
+  genes = left_join(genes,flybase,by = "GeneName")
+  genes$GeneName = factor(genes$GeneName, levels=SubGeneNames)
+  genes = genes[order(genes$GeneName),]
+} else {
+  genes = data.frame(gene_name = make.names(gsub("\\.","",SubGeneNames)))
+  genes$gene_name = factor(genes$gene_name,
+                           levels=make.names(gsub("\\.","",SubGeneNames)))
+}
+
+module=NULL
+for (color in module_colors){
+    module=c(module,paste0(color,",",genes[which(dynamicColors==color),2]))
+}
+write.table(module, paste0(directory,"/non_allele_PANGEA_FLYBASE.txt",sep=""), sep="\t", row.names=FALSE, col.names=FALSE,quote=FALSE)
+
+```
+
+
+```{r, fig.height=10,fig.width=12}
+
+MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+MEs = MEList$eigengenes
+
+plotEigengeneNetworks(fixDataStructure(MEs), "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2))
+
+```
+
+### Module Correlations
+
+```{r,figure.height=25,figure.width=24}
+
+# corrplot of just correltions
+M=cor(MEs)
+corrplot(M, method="circle",tl.cex=.5,tl.col="black",col = rev(COL2('RdBu', 200)))
+
+# Plot correlations wotj only high corr coefficients, we do this to verify very similar modules were merged
+M[M^2<0.95] = 0
+corrplot(M, method="circle",tl.cex=.5,tl.col="black",col = rev(COL2('RdBu', 200)))
+
+# For all module combinations run Granger causality to assess lead-lag
+res=NULL
+for(j in colnames(MEs)){
+  for(i in colnames(MEs)[colnames(MEs) != j ]){
+    f = as.formula(paste0(j, " ~ ", i))
+    g = grangertest(f, order = 6, data = MEs)
+    res = rbind(res,data.frame(ME1 = j, ME2 = i,  p = g$"Pr(>F)"[2],F = g$F[2]))
+  }
+}
+
+res$FDR = p.adjust(res$p,method="fdr")
+res = res[order(res$FDR,decreasing = F),]
+knitr::kable(res[res$FDR<0.05,], caption = "Significant Granger Causality")
+
+```
+
+### hub genes
+
+```{r}
+
+hubs = chooseTopHubInEachModule(datExpr,  dynamicColors,type="signed hybrid",power=set_soft_power)
+
+knitr::kable(hubs, caption = "Hub Genes")
+
+
+```
+
+### Eigen gene plot versus each individal gene's pseudotime
+
+```{r,fig.height=25,fig.width=11}
+
+MEs$embryoID = rownames(MEs)
+MEs.m = reshape2::melt(MEs,id.vars="embryoID")
+MEs.m = merge(MEs.m,subset(meta,select= c(embryoID,embryo_pt)),by="embryoID")
+MEs.m$variable = gsub("ME","",MEs.m$variable)
+
+ggplot(MEs.m,aes(x = embryo_pt, y=value,color=variable) )+geom_line(color="black",linewidth=1)+ facet_wrap(~variable,scales="free_y",ncol=4)+ geom_line() + theme_classic()+  scale_color_identity(guide = "legend")+theme(legend.position = "none",strip.background = element_blank())
+
+write.csv(MEs.m,paste0(directory,"non_allele_eigen_genes.csv"),row.names=F)
+
+```
+
+### Module eigen-genes overlayed with individual genes over pseudo time
+Top 24 genes based on correlation with eigen-gene
+
+```{r,fig.height=16,fig.width = 16}
+
+p = list()
+for(i in module_colors){
+  mod.t = MEs.m[MEs.m$variable == i,c(1,3,4)]
+  g.t = as.data.frame(datExpr[,which(dynamicColors==i)])
+  colnames(g.t) = SubGeneNames[which(dynamicColors==i)]
+  colnames(mod.t)[2] = "Eigen-Gene"
+  cors = NULL
+  for(j in 1:ncol(g.t)){
+    cors = rbind(cors,data.frame(j,R2 = stats::cor(g.t[,j],mod.t$`Eigen-Gene`)^2))
+  }
+  cors = cors[order(cors$R2,decreasing=T),]
+  
+  ix = head(cors,29)$j
+  
+  g.t$embryoID = rownames(g.t)
+  
+  ix = c(ix,ncol(g.t))
+  
+  tmp = reshape2::melt(merge(mod.t,g.t[,ix],by="embryoID"),id.vars=c("embryoID","embryo_pt"))
+  tmp$Eigen = ifelse(tmp$variable == "Eigen-Gene","Eigen Gene","Actual Gene")
+  
+  print(ggplot(tmp,aes(x=embryo_pt,y=value,color=Eigen))  +  geom_line(aes(group=variable),color="black",linewidth=.8,alpha=0.25)+ geom_line(aes(group=variable),alpha=0.35)+ theme_classic()+scale_color_manual(values=c("Eigen Gene" = i,"Actual Gene" = "grey50"))+facet_wrap(~variable,scale="free_y",ncol = 5)+ggtitle(i)+stat_smooth(method="gam",color=i,se=F))
+
+}
+
+
+```
+
+
+#### Activation
+
+
+```{r}
+
+tmp = as.data.frame(datExpr)
+tmp$embryoID = rownames(tmp)
+tmp2 = merge(tmp,subset(meta,select = c(embryoID,embryo_pt)),by="embryoID")
+tmp2 = tmp2[order(tmp2$embryo_pt,decreasing = F),]
+
+#Intiialize activation aka turn_on data frame
+turn_on = NULL
+for(i in 2:(ncol(tmp2)-1)){
+    
+  #Create temp df 
+   gam.df = subset(tmp2,select = c("embryo_pt", colnames(tmp2)[i]))
+   colnames(gam.df)[2] = "metab"
+   # fit gam and predict mean with 95% confidence interval bands
+   fit = mgcv::gam(metab~s(embryo_pt,bs="cs"),data=gam.df,method="REML")
+   pred = predict(fit, newdata=data.frame(embryo_pt = seq(1,250,1)),se=T)
+   pred$CIL = pred$fit - 1.96*pred$se.fit
+   
+   #Grab the first pseudo-time where the lower bound is greater than 1 and is thus activated"
+   acti = unname(which(pred$CIL > 1)[1])
+   # rbind the data frame together, slower than apply but easier to track
+   turn_on = rbind(turn_on,data.frame(Gene = colnames(tmp2)[i], mincp =acti ) )
+  
+}
+
+gam.fail = turn_on$Gene[is.na(turn_on$mincp)]
+knitr::kable(gam.fail, caption = "Genes where activation time could not be estimated")
+
+# Plot these genes if there are any
+if(length(gam.fail) > 0){
+  tmp3 = reshape2::melt(subset(tmp2,select= c('embryo_pt',gam.fail)),id.vars=c("embryo_pt"))
+  ggplot(tmp3,aes(x=embryo_pt,y=value)) +facet_wrap(~variable,scale="free_y") + geom_point()
+}
+
+#Remove the failed genes and run mixr to identify the number of activation modes. Increase max if you think that might be more. We found lnorm was a good fit based on BIC, but other families may work better for other data sets.
+clusts = turn_on[!is.na(turn_on$mincp) ,]
+s = mixR::select(clusts$mincp, ncomp = 1:6, family ="lnorm")
+
+#Create a mix fit based on the best fitting mixtures
+fit4=mixfit(clusts$mincp,family="lnorm",ncomp=s$ncomp[s$best == "*"],ev=I(s$equal.var[s$best == "*"] == "Y"))
+plot(fit4)
+
+#Extract the plotting data ad write out files for plotting in other softwaes
+pg <- ggplot_build(plot(fit4))
+
+write.table( pg$data[[1]],paste0(directory,"/activation_cluster_plot_bars.csv"),row.names = F,sep=",")
+
+write.table( pg$data[[2]],paste0(directory,"activation_cluster_plot_cluster_densities.csv"),row.names = F,sep=",")
+
+write.table( pg$data[[3]],paste0(directory,"/activation_cluster_plot_overall_density.csv"),row.names = F,sep=",")
+
+xx = fit4$comp.prob
+res.clust=NA
+for(i in 1:nrow(xx)){
+  
+  res.clust = rbind(res.clust,data.frame(gene = clusts$Gene[i], activation_PT = clusts$mincp[i], Cluster = which(xx[i,] == max(xx[i,])), Probability = max(xx[i,])))
+  
+  
+}
+
+##Make boxplotx of the activation time by cluster
+ggplot(res.clust,aes(x = Cluster,y = activation_PT,color=as.character(Cluster))) + 
+  scale_color_viridis_d() + theme_classic(12) +
+  geom_jitter(height=0,width=0.25) + geom_boxplot(outlier.size=-1,fill=NA)
+
+res.clust=na.omit(res.clust[order(res.clust$Cluster),])
+write.table(res.clust,paste0(directory,"/activation_cluster_ref.csv"),row.names = F,sep=",")
+
+
+
+```
+
+
+
+## Metabolites 
+### Remove large outliers
+
+
+
+```{r}
+
+#Function for identifying and removing outliers, outputs data frame af data before and after with both sets of GAM fits
+remove_outliers = function(tmp){
+  # Create temp data frame to work with
+  metab_t = colnames(tmp)[1]
+  colnames(tmp) = c("metab","pseudotime")
+  # Spline type and REML match p with ggplot defaults
+  fit_gam = mgcv::gam(metab~s(pseudotime,bs="cs"),data=tmp,method="REML")
+  # Get 99.7% prediction intervals (i.e 3 SD in both directions); we will capture all clear outliers and only remove a very small subset of the population (0.3%); these indivduals would all be highly influential as well. This focuses our pseudotime analyses on the more representative embryos
+  pred_alt = predict_gam(fit_gam,newdata=tmp,interval="pred",level=.997)
+  tmp$lower = (pred_alt[,3])
+  tmp$upper = (pred_alt[,4])
+  tmp$Predicted = (pred_alt$Estimate)
+
+  #Checking which y values are outside of the 99% confidence intervals
+  tmp$Outlier = ifelse(tmp$metab > tmp$upper | tmp$metab < tmp$lower, "Removed","Kept")
+
+  #Fit a second GAM on the outlier removed data and create a second data.frame
+  fit_gam2 = mgcv::gam(metab~s(pseudotime,bs="cs"),data=tmp[tmp$Outlier == "Kept",],method="REML")
+  tmp2 = tmp
+  tmp2$Predicted = predict_gam(fit_gam2,newdata=tmp,interval="pred",level=.95)$Estimate
+  
+  # Plot the original data with the gam before and after outlier removal, add print(p1) after this block to print every one.
+  p1 = ggplot(data=tmp,aes(x=pseudotime,y=metab,shape = Outlier)) +
+  geom_point() +
+  geom_line(data= tmp2, aes(x=pseudotime,y = Predicted,color="After Removal"),size=1) + 
+  geom_line(data= tmp, aes(x=pseudotime,y = Predicted,color="Before Removal"),size=1) +
+  geom_line(aes(x=pseudotime,y=lower,group=1),color="grey80",linetype=2) +
+  geom_line(aes(x=pseudotime,y=upper,group=1),color="grey80",linetype=2) +
+  theme_classic(14) +scale_color_manual(values = c("black","blue"))+ylab(metab_t)+ggtitle("ggplot splines")
+  
+  for.export = tmp
+  for.export$Predicted_outliers_removed = tmp2$Predicted
+  for.export$Metabolite = rep(metab_t)
+  tmp$metab[tmp$Outlier == "Removed"] = NA
+  tmp = subset(tmp,select=c(metab,pseudotime))
+  colnames(tmp) = c(metab_t,"embryo_pt")
+  
+  return(list(tmp,for.export))
+}
+
+metabs = read.csv(paste0(directory,"/metabolites_embryos.csv"),header=T)
+rownames(metabs) = metabs$X
+metabs=metabs[,-1]
+df = as.data.frame(t(metabs))
+df$embryoID = rownames(df)
+df = merge(df,subset(meta,select=c(embryoID,embryo_pt)),by="embryoID")
+
+#Initialize removed outlier df by running first metab then looping
+df.removed = remove_outliers(df[,c(2,ncol(df))])[[1]]
+
+for(x in 3:(ncol(df)-1)){   
+  df.removed = merge(df.removed,remove_outliers(df[,c(x,ncol(df))])[[1]],by="embryo_pt")
+}
+
+list.for.export = data.table::rbindlist(lapply( 2:(ncol(df)-1), function(x) remove_outliers(df[,c(x,ncol(df))])[[2]]))
+
+write.table(list.for.export, paste0(directory,"/metabolite_data_table.csv"),row.names = F)
+
+df.removed = merge(subset(df,select=c("embryoID","embryo_pt")),df.removed,by="embryo_pt")
+rownames(df.removed) = df.removed$embryoID
+
+datExpr= subset(df.removed[,-1])
+
+```
+
+
+### lead-lag Transcript_Modules and Metabs 
+#### modules predicting metabs (Best order)
+
+```{r}
+
+meta.expr = datExpr
+colnames(meta.expr) = make.names(colnames(meta.expr))
+meta.expr$embryoID = rownames(meta.expr)
+
+full.ll = merge(meta.expr,MEs, by="embryoID")
+full.ll = merge(full.ll,subset(meta,select=c(embryoID,embryo_pt)))
+
+res=NULL
+
+for(i in colnames(MEs)[colnames(MEs) != "embryoID"]){
+  for(j in colnames(meta.expr)[colnames(meta.expr) != "embryoID"]){
+    
+    ord = vars::VARselect(na.omit(subset(full.ll,select= c(i,j))),lag.max=6,type="const")
+    
+  
+    f = as.formula(paste0(j, " ~ ",i))
+    g = grangertest(f, order = ord$selection[1], data = full.ll)
+    
+    res = rbind(res,data.frame(Module = i, Metab = j,  p = g$"Pr(>F)"[2],F = g$F[2]))
+  }
+}
+
+
+res$FDR = p.adjust(res$p,method="fdr")
+res = res[order(res$FDR,decreasing = F),]
+
+write.table(res,"ll_trans_meta_modules.csv",sep=",",row.names=F)
+
+sig = res[res$FDR < .05,]
+
+if(nrow(sig)>0){
+  for(i in 1:nrow(sig)){
+    
+    tmp = subset(full.ll,select=c("embryo_pt",sig[i,]$Metab,sig[i,]$Module))
+    
+    tmp[,2] = scale(tmp[,2])
+    tmp[,3] = scale(tmp[,3])
+    colnames(tmp)[3] = substr(colnames(tmp)[3],3,50)
+    
+    m.tmp = reshape2::melt(tmp,id.vars = "embryo_pt")
+  
+    print(ggplot(m.tmp,aes(x = embryo_pt,y=value,color = variable))+ geom_point() + stat_smooth(method="gam") + theme_classic() + scale_color_manual(values = c("grey",colnames(tmp)[3])))
+    
+  }
+}
+
+```
+
+
+#### Metabs predicting modules (Best order)
+
+
+```{r}
+
+meta.expr = datExpr
+colnames(meta.expr) = make.names(colnames(meta.expr))
+meta.expr$embryoID = rownames(meta.expr)
+
+full.ll = merge(meta.expr,MEs, by="embryoID")
+full.ll = merge(full.ll,subset(meta,select=c(embryoID,embryo_pt)))
+
+res=NULL
+
+for(i in colnames(MEs)[colnames(MEs) != "embryoID"]){
+  for(j in colnames(meta.expr)[colnames(meta.expr) != "embryoID"]){
+
+    ord = cor.test(na.omit(subset(full.ll,select= c(i,j)))[,1],na.omit(subset(full.ll,select= c(i,j)))[,2])
+
+    res = rbind(res,data.frame(Module = i, Metab = j,  p = ord$p.value, R = ord$estimate  ))
+  }
+}
+
+
+res$FDR = p.adjust(res$p,method="fdr")
+
+res = res[order(res$FDR,decreasing = F),]
+
+```
+
+
+#### Metabs and Module correlations
+
+```{r}
+
+cp = rcorr.adjust(data.matrix(subset(full.ll,select= - c(embryoID,embryo_pt))))
+cp$R$r[cp$P>0.05] = 0
+
+new=cp$R$r
+#Drop grey module and keep only r squareds >0.25
+new = new[rownames(new) != "MEgrey",colnames(new) != "MEgrey"]
+new[abs(new) < 0.5] = 0
+colnames(new) = substr(colnames(new),3,50)
+ix=colnames(new)
+rownames(new) = substr(rownames(new),3,50)
+#Custome colors
+color = read.csv("~/bbc-secondary/research/LEMH_20231017_single_embryo_VBCS-759/Colors.csv",header=F)
+color$V1[color$V1 == "lisque4"] = "bisque4"
+color$V1[color$V1 == "thistle"] = "thistle2"
+color$V1[color$V1 == "orangered"] = "orangered4"
+color$V1[color$V1 == "darkorange "] = "darkorange"
+color$V1[color$V1 == "plum"] = "plum2"
+
+ix.c = match( gsub("ME","",colnames(new[rownames(new)%in%ix,colnames(new)%in%ix])) ,color$V1)
+hex.c = color$V2[ix.c]
+hex.c[is.na(hex.c)] = "grey92"
+
+set.seed(1)
+#functions to plot your graph
+g <- graph_from_adjacency_matrix(new[rownames(new) %in% ix,colnames(new) %in% ix],mode="upper",weighted = TRUE,diag=F)
+E(g)$cor <- E(g)$weight
+E(g)$weight <- abs(E(g)$cor)
+E(g)$color <- case_when( E(g)$cor < -0.75 ~ "blue",
+                         E(g)$cor < -0.5 ~ "darkblue",
+                         E(g)$cor < 0.5 ~ "black",
+                         E(g)$cor < 0.75 ~ "darkred",
+                         TRUE ~ "red")
+
+E(g)$width <- 2*rje::logit(abs(E(g)$weight+0.00000001))
+
+# Format vertices
+V(g)$size <- 3*abs(rowSums(new[rownames(new)%in%ix,colnames(new)%in%ix]))
+V(g)$shape
+V(g)$color <- hex.c
+V(g)$label.color <- "black"
+
+l = layout_with_fr(g)
+
+save(g,file = paste0(directory,"/single_embryo_network.rds"))
+
+plot(g,
+    vertex.size=7,
+    vertex.label.cex=.75,
+    vertex.label.color="black",layout=l,vertex.frame.color=ifelse(grepl("ME",colnames(new[rownames(new)%in%ix,colnames(new)%in%ix]),fixed=T),"transparent","black"),
+    vertex.frame.width =ifelse(grepl("ME",new[rownames(new)%in%ix,colnames(new)%in%ix],fixed=T),1,3))
+
+```
