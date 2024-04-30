@@ -1,0 +1,188 @@
+---
+title: "Pseudo-time analysis in single embryos"
+author: "J. Eduardo Pérez-Mojica"
+date: "2024-04-15"
+output:
+  html_document: 
+    df_print: paged
+  pdf_document: default
+---
+
+```{r make_outdir, warning=FALSE}
+outdir <- "./pseudotime_output/"
+dir.create(outdir, recursive=TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE, cache.lazy = FALSE,fig.width=8, fig.height=8)
+```
+
+# Install and load packages
+You can install using install.packages ("package") if it comes from CRAN or BiocManager::install("package")
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=FALSE, cache=FALSE}
+library(RaceID)
+library(interp)
+library(ShortRead)
+library(RUVSeq)
+library(EDASeq)
+library(splineTimeR)
+```
+
+Prepare raw read count matrix
+```{r get_std_chroms}
+#Read raw read counts files
+Lib1 <-read.csv("./pseudotime_input/M1.STARsolo_raw.counts.txt", sep="\t", header=TRUE, row.names = 1)
+Lib2 <-read.csv("./pseudotime_input/M2.STARsolo_raw.counts.txt", sep="\t", header=TRUE, row.names = 1)
+Lib3 <-read.csv("./pseudotime_input/M3.STARsolo_raw.counts.txt", sep="\t", header=TRUE, row.names = 1)
+Lib4 <-read.csv("./pseudotime_input/M4.STARsolo_raw.counts.txt", sep="\t", header=TRUE, row.names = 1)
+
+#Read sample IDs
+sampleID.1_2 <-read.csv("./pseudotime_input/new_sample_id1.txt", sep="\t", header=TRUE, row.names = 1)
+sampleID.3_4 <-read.csv("./pseudotime_input/new_sample_id2.txt", sep="\t", header=TRUE, row.names = 1)
+
+#Combine counts from the four different libraries into a single matrix
+samples <- cbind(Lib1[,1:96],Lib2[,97:192],Lib3[,1:96],Lib4[,97:192])
+```
+
+RaceID workflow (Herman et al., 2018. DOI: 10.1038/nmeth.4662) was used to identified unfertilized eggs and embryos older than 3 hours. A step-by-step protocol can be found in Pérez-Mojica et al., DOI: 10.1016/j.xpro.2023.102535. After identification, unfertilized eggs were re-labelled with sample names starting with "U" and included in the analysis. Embryos identified to be older than 3 hours and samples in 1 sample clusters were excluded from the analysis. Additionally, samples that failed in metabolomics analysis were also excluded from the final analysis (code below). 
+
+```{r}
+#Assign samples names to barcode numbers
+colnames(samples) <- c(sampleID.1_2[,1],sampleID.3_4[,1])
+
+#Samples excluded in final dataset
+older_embryos <- c("E1B.06","E1C.08","E1A.10","E1C.10","E1B.12","E1A.20","E1B.20",
+                   "E1C.20","E2A.20","E3A.20","E1C.24","E1C.27","E1C.28","E1A.34",
+                   "E1B.11","E1C.11","E1C.15","E3C.20","E1B.25","E1A.35","E1A.39",
+                   "E1A.06","E1A.15","E1C.17","E3A.11","E3C.19","E1A.24","E1A.28",
+                   "E1C.21","E3B.25","E3C.23","E1B.05","E1C.07","E1B.18","E2A.13",
+                   "E3B.24","E3C.29","E1A.31","E1A.32","E1C.32","E1C.35","E2A.35",
+                   "E1B.08","E2A.04","E3B.02","E3B.04","E1B.17","E3A.12","E1B.40",
+                   "E3A.03","E1B.19","E3A.30","E3C.30","E1B.31","E2A.38","E2B.02",
+                   "E2A.34","E2C.05")
+outlier_embryos <- c("E3A.34","E3C.31") 
+failed_samples_metabolomics <- c("E3A.37","E2C.01","E2A.19","U1O.07","E3A.25",
+                                 "E1B.13","E2C.07","E1C.25","E1A.13")
+samples <- samples[,!(names(samples) %in% c(older_embryos,outlier_embryos,failed_samples_metabolomics))]
+samples <- samples[grep("ERCC",rownames(samples),invert=TRUE),]
+```
+
+For the final sample set, the RaceID worflow was rerun one last time using the same parameters as in previous iterations. 
+
+```{r}
+#Create a SCseq class object, central for RaceID
+sc <- SCseq(samples) 
+#Filter genes and embryos to be included
+sc <- filterdata(sc, minexpr = 5, minnumber = 5, LBatch = NULL, mintotal=150000)
+#Compute distance matrix
+sc <- compdist(sc,metric="spearman", FSelect = FALSE,knn = NULL,alpha = 3)
+#Cluster samples
+sc <- clustexp(sc, rseed = 12345, samp = 1000 , FUNcluster = "kmedoids", verbose = F)
+#Identify outliers
+sc <- findoutliers(sc, probthr = 0.001, outlg = 3, outminc = 5, verbose = FALSE)
+#Compute and plot t-SNE map
+sc <- comptsne(sc,perplexity = 17, rseed = 420)
+plotmap(sc,cex=3)
+```
+
+Use sc, esg, scw, pnr, ths, and tin expression to establish developmental trajectory.
+
+```{r}
+#sc, esg, and scw are some of the first expressed zygotic genes, around 1.5h into development. Younger embryos and unfertilized eggs do not expressed these genes. 
+plotexpmap(sc, g=c("sc","esg","scw"), n="sc+esg+scw log", logsc = TRUE, cex = 3)
+#pnr, ths, and tin peak expression later, around 3h into development. Younger embryos and unfertilized eggs do not expressed these genes. 
+plotexpmap(sc, g=c("pnr","ths","tin"), n="pnr+ths+tin log", logsc = TRUE, cex = 3)
+```
+
+RaceID clusters were then used to infer a lineage tree. This is the base to establish our embryo pseudo-time.
+
+```{r}
+#Create the lineage tree object
+ltr <- Ltree(sc) 
+#Compute transcriptome entropy
+ltr <- compentropy(ltr) 
+#Project embryos onto inter-cluster links
+ltr <- projcells(ltr,cthr=2, nmode=TRUE,knn=3)
+ltr <- projback(ltr, fast=FALSE, rseed=17000)
+#Compute lineage tree line between clusters with p-values
+ltr <- lineagegraph(ltr, verbose=FALSE)
+ltr <- comppvalue(ltr,pthr=0.05, sensitive = TRUE)
+#Plot and inspect lineage graph to identify developmental trajectories 
+plotgraph(ltr,showCells=FALSE,showMap=TRUE, cex = 3)
+x <- compscore(ltr, show=FALSE)
+#Create vector of sample's Ids according to cluster sequence of embryo developmentl trajectory
+n <- cellsfromtree(ltr,c(1,3,8,5,4,7,2)) 
+#Extract vector of sample's Ids (embryo pseudo-time)  
+embryo_pseudotime <- row.names(as.data.frame(ltr@sc@cpart[n$f]))
+#Extract raw read counts. This include all samples in t-SNE map.
+raw_read_counts<-as.matrix(getExpData(sc))
+```
+
+# Noramlization using RUVg
+Use the raw read counts from RaceID analysis and normalize them using Remove Unwanted Variation strategy (RUV, Risso et al., 2014. DOI: 10.1038/nbt.2931) and a set of 40 genes stably expressed over our pseudo-time window. The set of stable genes includes the least variable 10 genes in each quartile when genes are order by average expression in the first 3 hours of development (Pérez-Mojica et. al., 2023. DOI: 10.1016/j.xgen.2023.100265).
+
+```{r}
+control_genes <- c("eEF1alpha1","mt:lrRNA","mt:ATPase6","Act5C","mt:Cyt-b","Hsc70-4",
+                     "mt:CoI","Cam","mt:CoIII","mt:CoII","fs(2)ltoPP43","Rpt4","SmD2",
+                     "Eb1","CG15237","wal","CG31195","zf30C","Sap47","baf","SkpA","cnk",
+                     "Hcf","Srp54k","PlexA","CG9302","anne","Myb","CG1103","kuz","Pex2",
+                     "sl","CG31715","HP1c","RpLP0-like","Mettl14","ttv","SmE","vito","Nup205")
+#Create SeqExpressionSet (needed for RUVg)
+set <- newSeqExpressionSet(as.matrix(raw_read_counts))
+#Implement RUVg method of Risso et al., 2014.
+setRUVg <- RUVg(set, control_genes, k=1)
+
+#Relative Log Expression (RLE) plot of read counts in embryo pseudo-time before normalization
+plotRLE(set@assayData[["counts"]][,embryo_pseudotime], outline=FALSE, ylim=c(-3, 3))
+#RLE plot of read counts in embryo pseudo-time after normalization
+plotRLE(setRUVg@assayData[["normalizedCounts"]][,embryo_pseudotime], outline=FALSE, ylim=c(-3, 3))
+
+#Extract normalized read counts
+norm_counts <-setRUVg@assayData[["normalizedCounts"]]
+#Add a '0.1' pseudo-count to values equal to '0'
+norm_counts[norm_counts==0]<-0.1
+#Update gene names (Flybase, gene map table 2023_06)
+updated_genenames <-read.csv("./pseudotime_input/current_geneID.csv", sep=",", header=TRUE, row.names = 1)
+norm_counts <- cbind(updated_genenames, norm_counts)
+#Print normalized read counts to a file
+write.csv(norm_counts, file = paste0(outdir, "normalized_reads_all.csv"))
+#Print normalized read counts in embryo pseudo-time order to a file
+write.csv(norm_counts[,embryo_pseudotime], file = paste0(outdir, "normalized_reads_by_embryo_pseudotime.csv"))
+```
+
+# Sex-specific gene expression analysis
+Identify embryo sex by analyzing Sxl and msl-2 gene expression as described step by step on Pérez-Mojica et. al., 2023. DOI: 10.1016/j.xpro.2023.102535. Then, use splineTimeR R package to determine sex-specific expression (Michna et al., 2016. DOI: 10.1371/journal.pone.0160791). First, import metadata with all information needed for splineTimeR analysis. Second, select read counts of samples with identified sex and generate additional clusters at the beginning and end to bias the first and last time points towards the null. Cluster information from RaceID analysis was used as 'Time' factor for splineTimeR. For sex-bias differences in metabolite abundance replace the normalized read counts for the normalized metabolite data. 
+
+```{r}
+#Read metadata
+metadata_splineTimeR <-read.csv("./pseudotime_input/splineTimeR_metadata.csv", sep=",", header=TRUE)
+row.names(metadata_splineTimeR) <- metadata_splineTimeR[,1]
+
+#Create read count matrix with additional clusters (n=10 samples/sex) at the start and end
+samples_splineTimeR <-norm_counts[,embryo_pseudotime]
+samples_splineTimeR <-cbind(samples_splineTimeR[, 115:124],samples_splineTimeR[, 115:253], 
+                            samples_splineTimeR[, 244:253], samples_splineTimeR[, 244:253])
+colnames(samples_splineTimeR) <- metadata_splineTimeR[,1]
+
+#Keep genes with a minimum of 3 read counts in at least 10 samples (excluding generated clusters)
+filtered_genes <- rowSums(samples_splineTimeR[21:149]>2)>9 
+table(filtered_genes)
+samples_splineTimeR <- samples_splineTimeR[filtered_genes,]
+
+#Run splineTimeR 
+phenoData <- new("AnnotatedDataFrame", data=metadata_splineTimeR)
+minimalSet <- ExpressionSet(assayData=as.matrix(samples_splineTimeR), phenoData = phenoData)
+diffExprs <- splineDiffExprs(eSetObject = minimalSet, df = 3,
+                             cutoff.adj.pVal = 0.05, reference = "MALE",
+                             intercept = TRUE)
+#Print results to a file
+write.csv(diffExprs, file = paste0(outdir, "diffexp_genes_male_female_nonallele.csv"))
+```
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+

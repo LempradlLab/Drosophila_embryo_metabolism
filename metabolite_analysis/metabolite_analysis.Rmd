@@ -1,0 +1,148 @@
+---
+title: "Inter- and intra-batch metabolite signal correction in single embryos"
+author: "J. Eduardo Pérez-Mojica"
+date: "2024-04-25"
+output:
+  html_document: 
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE, cache=FALSE, cache.lazy = FALSE,fig.width=8, fig.height=8)
+```
+
+# Install and load packages
+
+```{r loadlibs, echo=TRUE, warning=TRUE, message=FALSE, cache=FALSE}
+library(statTarget)
+library(MatrixGenerics) 
+```
+
+# Before you start: Experimental requirements for this workflow
+Each LC-MS batch started with an injection of the blank to assess initial background signal, followed by two injections of the quality control (QC) sample for column conditioning. A third QC  sample was injected and used for post-hoc QC correction. Samples were ran in randomized order, with a QC injection every 8-9 samples. At the end of the experiment, after the final QC sample, a blank was injected again to assesses the final background signal.
+
+The QC sample should be prepared using the same matrix (biological origin) as the samples. Here, QC samples were prepared by aliquoting metabolite extracts from a sample containing 300 Drosophila embryos (0-3h). Because a new QC sample was run with each batch, we used QC metabolite signals for both inter- and intra-batch correction, eliminating the need for a separate batch control.
+
+
+# QC based signal drift correction (QC-corrected values)
+QC based signal drift correction was perfromed on the raw metabolite signals (peak areas in arbitrary units) using starTarget R package (Luan et al., 2018. DOI: 10.1016/j.aca.2018.08.002). Sample IDs in the metadata file must match name and order in the file containing metabolite peak areas. To ensure that metabolite signals were unambiguously resolved in each run batch, we performed signal drift correction in each run batch separately. We excluded metabolite with a percentage coefficient of variation (CV)>20% in at least one run batch. As an example, the code for signal drift correction for batch 1.1 of the ion-paired method is presented below.
+
+```{r warning=FALSE}
+#Specify path for metadata file
+samPeno <- paste("./metabolite_input/metadata_ip_batch1.1.csv", sep=',')
+#Specify path for peak area file
+samFile <- paste("./metabolite_input/peak_area_ip_batch1.1.csv", sep=',')
+#QC based signal drift correction
+shiftCor(samPeno,samFile, Frule = 0.8, MLmethod = "QCRFSC", QCspan=0.75, degree=2, imputeM = "KNN", coCV = 20, plot = FALSE)
+
+```
+
+# Metabolite variance analysis
+Here we used the QC-corrected metabolite values and compared their variance with the variance for the same metabolite in the raw values using the rowVars function (Ahlmann-Eltze et al., DOI: 10.18129/B9.bioc.MatrixGenerics). QC-corrected values were only kept when variance decreased, otherwise, raw values for a specific metabolite were scaled to make QC value averages in each batch consistent across all batches (next step). As an example, the code for variance analysis on metabolites resolved by the ion-paired method is presented below.
+
+```{r}
+#Import data (ion-paired method)
+peak_area_ip <-read.csv("./metabolite_input/variance_analysis_ip_method.csv", sep=",", header = TRUE)
+
+#Create a matrix with the raw values
+raw_values <- peak_area_ip[grep("raw", peak_area_ip$type),]
+rownames(raw_values) <- raw_values[,2]
+raw_values <- raw_values[,3:ncol(raw_values)]
+#Analyse metabolite variance in raw values
+raw_variance <- rowVars(as.matrix(raw_values), useNames = FALSE)
+
+#Create a matrix with the QC-corrected values
+QCcorrected_values <- peak_area_ip[grep("QCcorrected", peak_area_ip$type),]
+rownames(QCcorrected_values) <- QCcorrected_values[,2]
+QCcorrected_values <- QCcorrected_values[,3:ncol(QCcorrected_values)]
+#Analyse metabolite variance in QC-corrected values
+QCcorrected_variance <- rowVars(as.matrix(QCcorrected_values), useNames = FALSE)
+
+#Compare variance between raw and QC-corrected values
+comparison <- as.data.frame(cbind(raw_variance, QCcorrected_variance))
+comparison$results <- ifelse(comparison$raw_variance < comparison$QCcorrected_variance, 'Variance_INCREASED',
+                             ifelse(comparison$raw_variance > comparison$QCcorrected_variance, 
+                                    'Variance_decreased', 'Same'))
+rownames(comparison) <- rownames(QCcorrected_values)
+
+#Select QC-corrected values only for metabolites that decreased variance upon correction
+QCcor_list <- comparison[grep("Variance_decreased", comparison$results),]
+QCcorrected_metabolites <- QCcorrected_values[rownames(QCcor_list),]
+#Print the first QC-corrected values of the data.frame
+head(QCcorrected_metabolites)
+
+
+```
+
+# QC based inter-batch correction (QC-adjusted values)
+Because each metabolite signal is unique and QC based signal drift correction may increase data variance, we used the QC raw signals to generate scaling factors for data correction instead of QC-correction for those metabolites increasing variance. Scaling factors were created by standardizing the QC average values across all batches (inter-batch correction). Subsequently, metabolite raw values were corrected by multiplying the QC scaling factor from a specific batch by the raw values of samples run in the same batch. Below is an example of the code for QC-based adjustment for the ion-paired method.
+
+```{r}
+#Select metabolites that increase variance upon QC-correction
+QCadj_list <- comparison[grep("Variance_INCREASED", comparison$results),]
+
+#Import QC raw values
+QC_raw_values <- read.csv("./metabolite_input/qc_raw_values.csv", sep=",", header = TRUE, row.names = 1)
+QC_raw_values <- QC_raw_values[rownames(QCadj_list),]
+
+#Create scaling factor for each metabolite in each batch
+QCfactors_batch1.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,1:4])
+QCfactors_batch1.2 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,5:7])
+QCfactors_batch2.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,8:11])
+QCfactors_batch2.2 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,12:15])
+QCfactors_batch3.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,16:19])
+QCfactors_batch3.2 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,20:23])
+QCfactors_batch4.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,24:27])
+QCfactors_batch4.2 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,28:31])
+QCfactors_batch5.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,32:35])
+QCfactors_batch5.2 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,36:39])
+QCfactors_batch6.1 <- rowMeans(QC_raw_values[,1:45])/rowMeans(QC_raw_values[,41:45])
+
+#Scale raw metabolite values using the scaling factors for each metabolite in each batch
+QCadj_values <- raw_values[rownames(QCadj_list),]
+QCadj_values[,1:34] <- QCfactors_batch1.1 * QCadj_values[,1:34]
+QCadj_values[,35:56] <- QCfactors_batch1.2 * QCadj_values[,35:56]
+QCadj_values[,57:90] <- QCfactors_batch2.1 * QCadj_values[,57:90]
+QCadj_values[,91:123] <- QCfactors_batch2.2 * QCadj_values[,91:123]
+QCadj_values[,124:157] <- QCfactors_batch3.1 * QCadj_values[,124:157]
+QCadj_values[,158:190] <- QCfactors_batch3.2 * QCadj_values[,158:190]
+QCadj_values[,191:224] <- QCfactors_batch4.1 * QCadj_values[,191:224]
+QCadj_values[,225:257] <- QCfactors_batch4.2 * QCadj_values[,225:257]
+QCadj_values[,258:291] <- QCfactors_batch5.1 * QCadj_values[,258:291]
+QCadj_values[,292:324] <- QCfactors_batch5.2 * QCadj_values[,292:324]
+QCadj_values[,325:375] <- QCfactors_batch6.1 * QCadj_values[,325:375]
+QCadjusted_metabolites <- QCadj_values
+
+#Print the first QC-adjusted values of the data.frame
+head(QCadjusted_metabolites)
+
+
+```
+
+# Matching normalized metabolite values to the RNA-seq embryo pseudo-time
+Normalized metabolite values (QC-corrected values or QC-adjusted values) in each sample were matched with the RNA-seq pseudo-time to create a timeline of metabolite abundance during early Drosophila development.
+
+```{r}
+#Import RNA-seq embryo developmental order
+embryo_pseudotime <- read.csv("./metabolite_input/embryo_pseudotime.csv", sep=",", header = TRUE, row.names = 1)
+#Create a matrix with both QC-corrected or QC-adjusted values (normalized data)
+norm_metabolite_values <- rbind(QCcorrected_metabolites, QCadjusted_metabolites)
+#Get normalized metabolite values in pseudo-time order
+metabolites_by_pseudotime <- norm_metabolite_values[ ,rownames(embryo_pseudotime)]
+is.num <- sapply(metabolites_by_pseudotime, is.numeric)
+metabolites_by_pseudotime[is.num] <- lapply(metabolites_by_pseudotime[is.num], round, 1)
+#Print the first metabolite values
+head(metabolites_by_pseudotime)
+#Print normalized metabolite values in embryo pseudo-time order to a file
+write.csv(metabolites_by_pseudotime, file = "metabolites_by_embryo_pseudotime.csv")
+
+```
+
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
